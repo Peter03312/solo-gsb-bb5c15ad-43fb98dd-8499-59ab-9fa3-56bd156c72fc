@@ -5,7 +5,11 @@ POST /api/v1/trips/{trip_id}/risk-budget：
 只按最高权重计入；返回按时间排列的恒权重正时长区间（相接且同权重合并）、
 各段及总计加权秒数、累计值首次达到预算的时刻；未达预算时刻为 null，
 无暴露返回零总计与空区间。区域与车次点集从同一已提交读视图读取。
+加权秒数按精确算术累计并以可序列化的有限数值返回（极大有限权重不溢出）；
+达标判定无容差，仅真实累计达到预算才返回首次达到时刻。
 """
+import math
+import sys
 import threading
 
 from tests.conftest import DAY_WINDOWS, SQUARE, register_square
@@ -479,6 +483,106 @@ def test_missing_field_rejected(client):
         "zone_weights": {"rb": 1.0},
     })
     assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------
+# 精确累计与达标判定：极大有限权重不溢出、达标判定无容差
+# ---------------------------------------------------------------------
+
+def test_huge_weight_overflow_returns_finite_values(client):
+    """权重 1e308、有效占用 2 秒：真实加权秒数 2e308 超出 float64 有限范围，
+    各段与总计钳到最大有限浮点值返回（可序列化），合法查询不失败；
+    达标判定仍按真实累计值进行。"""
+    register_square(client, zone_id="huge")
+    _upload(client, "THUGE", [
+        ("a", "2026-09-30T10:00:00Z", 0, 50),
+        ("b", "2026-09-30T10:00:02Z", 2, 50),
+    ])
+    r = _ask(client, "THUGE", zone_weights={"huge": 1e308},
+             budget_weighted_sec=1.5e308)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["segments"]) == 1
+    seg = body["segments"][0]
+    assert seg["duration_sec"] == 2.0
+    assert seg["weight"] == 1e308
+    # 2e308 不可表示为有限 float64：钳到最大有限值，仍为可序列化的有限数值
+    assert seg["weighted_sec"] == sys.float_info.max
+    assert body["total_weighted_sec"] == sys.float_info.max
+    assert math.isfinite(seg["weighted_sec"]) and math.isfinite(body["total_weighted_sec"])
+    # 真实累计 2e308 >= 预算 1.5e308：进入 1.5 秒时达到
+    assert body["budget_reached_at"] == "2026-09-30T10:00:01.500000Z"
+
+
+def test_huge_weight_finite_total_not_reached(client):
+    """权重 1e308、有效占用 1 秒：真实总计恰为 1e308（有限，不钳制）；
+    预算 1.5e308 未达到返回空时刻，预算恰为 1e308 在段末达到。"""
+    register_square(client, zone_id="huge1s")
+    _upload(client, "TH1S", [
+        ("a", "2026-09-30T10:00:00Z", 0, 50),
+        ("b", "2026-09-30T10:00:01Z", 1, 50),
+    ])
+    r = _ask(client, "TH1S", zone_weights={"huge1s": 1e308},
+             budget_weighted_sec=1.5e308)
+    body = r.json()
+    assert body["segments"][0]["weighted_sec"] == 1e308
+    assert body["total_weighted_sec"] == 1e308
+    assert body["budget_reached_at"] is None
+
+    r2 = _ask(client, "TH1S", zone_weights={"huge1s": 1e308},
+              budget_weighted_sec=1e308)
+    assert r2.json()["budget_reached_at"] == "2026-09-30T10:00:01Z"
+
+
+def test_huge_weight_accumulates_across_segments(client):
+    """多段精确累计：两段各 2 秒、权重 1e307，真实总计 4e307；
+    预算 3e307 在第二段进入 1 秒时达到。"""
+    assert client.post("/api/v1/zones", json={
+        "zone_id": "hz1",
+        "exterior": [[0, 0], [2, 0], [2, 10], [0, 10]],
+        "holes": [], "windows": DAY_WINDOWS,
+    }).status_code == 201
+    assert client.post("/api/v1/zones", json={
+        "zone_id": "hz2",
+        "exterior": [[4, 0], [6, 0], [6, 10], [4, 10]],
+        "holes": [], "windows": DAY_WINDOWS,
+    }).status_code == 201
+    _upload(client, "THZ", [
+        ("a", "2026-09-30T10:00:00Z", 0, 5),
+        ("b", "2026-09-30T10:00:06Z", 6, 5),
+    ])
+    r = _ask(client, "THZ", zone_weights={"hz1": 1e307, "hz2": 1e307},
+             budget_weighted_sec=3e307)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["segments"]) == 2
+    assert body["total_weighted_sec"] == 4e307
+    # 第一段累计 2e307 < 3e307；第二段进入 1 秒（10:00:05）达到
+    assert body["budget_reached_at"] == "2026-09-30T10:00:05Z"
+
+
+def test_budget_just_above_total_not_reached(client):
+    """达标判定无容差：总计 100，预算 100.0000000005（差 5e-10）不得误报已达到；
+    预算恰等于总计在时段结束达到仍有效；预算略低于总计正常返回达到时刻。"""
+    register_square(client, zone_id="tol")
+    _upload(client, "TTOL", [
+        ("a", "2026-09-30T10:00:00Z", 0, 50),
+        ("b", "2026-09-30T10:01:40Z", 100, 50),
+    ])
+    r = _ask(client, "TTOL", zone_weights={"tol": 1.0},
+             budget_weighted_sec=100.0000000005)
+    body = r.json()
+    assert body["total_weighted_sec"] == 100.0
+    assert body["budget_reached_at"] is None
+
+    # 预算恰好等于真实总计：恰在时段结束达到，仍有效
+    r2 = _ask(client, "TTOL", zone_weights={"tol": 1.0}, budget_weighted_sec=100.0)
+    assert r2.json()["budget_reached_at"] == "2026-09-30T10:01:40Z"
+
+    # 预算略低于总计（差 5e-10）：真实累计达到，返回首次达到时刻
+    r3 = _ask(client, "TTOL", zone_weights={"tol": 1.0},
+              budget_weighted_sec=99.9999999995)
+    assert r3.json()["budget_reached_at"] is not None
 
 
 # ---------------------------------------------------------------------
