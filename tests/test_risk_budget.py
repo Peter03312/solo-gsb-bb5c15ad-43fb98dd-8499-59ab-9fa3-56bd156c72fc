@@ -5,7 +5,12 @@ POST /api/v1/trips/{trip_id}/risk-budget：
 只按最高权重计入；返回按时间排列的恒权重正时长区间（相接且同权重合并）、
 各段及总计加权秒数、累计值首次达到预算的时刻；未达预算时刻为 null，
 无暴露返回零总计与空区间。区域与车次点集从同一已提交读视图读取。
+加权秒数按有理数精确累计（不加容差）：极大有限权重（如 1e308）不再溢出，
+各段与总计输出为可序列化的有限数值（超范围饱和到最大有限值）；
+仅真实累计达到预算才给出达到时刻（恰在段末/查询结束达到仍有效）。
 """
+import math
+import sys
 import threading
 
 from tests.conftest import DAY_WINDOWS, SQUARE, register_square
@@ -371,6 +376,122 @@ def test_revision_and_track_version_together(client):
     assert body["revision"] == 1
     assert body["track_version"] == 1
     assert body["total_weighted_sec"] == 40.0
+
+
+# ---------------------------------------------------------------------
+# 精确累计与达标判定（极大权重不溢出、无容差误判）
+# ---------------------------------------------------------------------
+
+# 静止在方块中央 (50,50)：10:00:00 起 2 秒有效占用
+STAY2 = [
+    ("a", "2026-09-30T10:00:00Z", 50, 50),
+    ("b", "2026-09-30T10:00:02Z", 50, 50),
+]
+
+
+def test_huge_weight_no_overflow_finite_output(client):
+    """权重 1e308 × 2 秒 = 2e308 加权秒超出 float64：合法查询不再失败，
+    各段与总计作为可序列化的有限数值返回（饱和到最大有限 float）。"""
+    register_square(client, zone_id="hw")
+    _upload(client, "THW", STAY2)
+    r = _ask(client, "THW", zone_weights={"hw": 1e308},
+             budget_weighted_sec=1e308)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    seg = body["segments"][0]
+    assert seg["duration_sec"] == 2.0
+    assert seg["weight"] == 1e308
+    # 真实加权秒数 2e308 超出 float64：饱和为最大有限值，且可序列化
+    assert seg["weighted_sec"] == sys.float_info.max
+    assert body["total_weighted_sec"] == sys.float_info.max
+    assert math.isfinite(seg["weighted_sec"])
+    assert math.isfinite(body["total_weighted_sec"])
+    # 预算 1e308 在 2 秒段的第 1 秒整达到
+    assert body["budget_reached_at"] == "2026-09-30T10:00:01Z"
+
+
+def test_huge_weight_budget_reached_at_max_finite(client):
+    """预算取最大有限 float（< 真实总计 2e308）：仍给出精确反推的达到时刻。"""
+    register_square(client, zone_id="hwm")
+    _upload(client, "THM", STAY2)
+    r = _ask(client, "THM", zone_weights={"hwm": 1e308},
+             budget_weighted_sec=sys.float_info.max)
+    body = r.json()
+    # 1.7976931348623157e308 / 1e308 = 1.7976931348623157 秒
+    assert body["budget_reached_at"] == "2026-09-30T10:00:01.797693Z"
+
+
+def test_huge_weight_not_reached(client):
+    """权重 1e308 × 1 秒 = 1e308 加权秒（不溢出）；预算更大时未达、返回空时刻。"""
+    register_square(client, zone_id="hwn")
+    _upload(client, "THN", [
+        ("a", "2026-09-30T10:00:00Z", 50, 50),
+        ("b", "2026-09-30T10:00:01Z", 50, 50),
+    ])
+    r = _ask(client, "THN", zone_weights={"hwn": 1e308},
+             budget_weighted_sec=1.5e308)
+    body = r.json()
+    assert body["segments"][0]["weighted_sec"] == 1e308
+    assert body["total_weighted_sec"] == 1e308
+    assert body["budget_reached_at"] is None
+
+
+def test_budget_just_above_total_not_reached(client):
+    """总计 100 而预算 100.0000000005：真实累计未达到，不得误报已达到。"""
+    register_square(client, zone_id="eps1")
+    _upload(client, "TE1", [
+        ("a", "2026-09-30T10:00:00Z", 50, 50),
+        ("b", "2026-09-30T10:00:50Z", 50, 50),  # 50s × 权重 2 = 100 加权秒
+    ])
+    r = _ask(client, "TE1", zone_weights={"eps1": 2.0},
+             budget_weighted_sec=100.0000000005)
+    body = r.json()
+    assert body["total_weighted_sec"] == 100.0
+    assert body["budget_reached_at"] is None
+
+
+def test_budget_just_below_total_reached(client):
+    """预算 99.9999999995（恰低于总计 100）：真实累计达到，给出达到时刻。"""
+    register_square(client, zone_id="eps2")
+    _upload(client, "TE2", [
+        ("a", "2026-09-30T10:00:00Z", 50, 50),
+        ("b", "2026-09-30T10:00:50Z", 50, 50),
+    ])
+    r = _ask(client, "TE2", zone_weights={"eps2": 2.0},
+             budget_weighted_sec=99.9999999995)
+    body = r.json()
+    assert body["total_weighted_sec"] == 100.0
+    assert body["budget_reached_at"] is not None
+
+
+def test_budget_reached_exactly_at_query_until(client):
+    """累计恰在查询时段结束（until）达到预算：仍有效，达到时刻为 until。"""
+    register_square(client, zone_id="eps3")
+    _upload(client, "TE3", [
+        ("a", "2026-09-30T10:00:00Z", 50, 50),
+        ("b", "2026-09-30T10:00:50Z", 50, 50),
+    ])
+    r = _ask(
+        client, "TE3",
+        since="2026-09-30T09:00:00Z", until="2026-09-30T10:00:50Z",
+        zone_weights={"eps3": 2.0}, budget_weighted_sec=100.0,
+    )
+    body = r.json()
+    assert body["total_weighted_sec"] == 100.0
+    assert body["budget_reached_at"] == "2026-09-30T10:00:50Z"
+
+
+def test_fractional_weight_accumulation_exact(client):
+    """多段小数权重精确累计：0.1 权重三段共 0.3 加权秒，预算 0.3 恰好达到。"""
+    register_square(client, zone_id="fx")
+    _upload(client, "TFX", [
+        ("a", "2026-09-30T10:00:00Z", 50, 50),
+        ("b", "2026-09-30T10:00:03Z", 50, 50),  # 3s × 0.1 = 0.3 加权秒
+    ])
+    r = _ask(client, "TFX", zone_weights={"fx": 0.1}, budget_weighted_sec=0.3)
+    body = r.json()
+    assert body["total_weighted_sec"] == round(0.1 * 3, 6)
+    assert body["budget_reached_at"] == "2026-09-30T10:00:03Z"
 
 
 # ---------------------------------------------------------------------

@@ -5,7 +5,9 @@ import bisect
 import heapq
 import json
 import math
+import sys
 from datetime import datetime, timezone
+from fractions import Fraction
 from typing import Any, Dict, List, Optional, Tuple
 
 from shapely.geometry import Polygon
@@ -29,6 +31,23 @@ class NotFoundError(Exception):
 
 def _iso_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+_FLOAT_MAX = sys.float_info.max
+_FLOAT_MAX_FRAC = Fraction(_FLOAT_MAX)
+
+
+def _finite_float(value: Fraction) -> float:
+    """把精确有理数转换为可 JSON 序列化的有限 float。
+
+    真实值超出 float64 有限范围时（如权重 1e308 × 2 秒 = 2e308 加权秒）
+    饱和到最大有限值，保证响应字段始终是有限的、可序列化的数值。
+    """
+    if value >= _FLOAT_MAX_FRAC:
+        return _FLOAT_MAX
+    if value <= -_FLOAT_MAX_FRAC:
+        return -_FLOAT_MAX
+    return float(value)
 
 
 def _validate_revision_param(raw: Any) -> int:
@@ -877,7 +896,9 @@ class AuditService:
           重叠区域同时占用时只按最高权重计入，轨迹未覆盖或不在指定区内的时间不计；
         - 区域（含指定修订号）与车次点集（含指定/最新版本）从**同一已提交读视图**读取；
         - 返回按时间排列的恒权重正时长区间（相接且同权重合并）、各段及总计加权秒数、
-          累计值首次达到预算的时刻；未达到预算时刻为 null，无暴露总计 0 且区间为空。
+          累计值首次达到预算的时刻；未达到预算时刻为 null，无暴露总计 0 且区间为空；
+        - 加权秒数按有理数精确累计（不加容差），仅真实累计达到预算才给出达到时刻；
+          各段与总计输出为可序列化的有限数值，超出 float64 范围时饱和到最大有限值。
         """
         if not isinstance(trip_id, str) or not trip_id.strip():
             raise ValidationError("trip_id 必须是非空字符串")
@@ -972,25 +993,32 @@ class AuditService:
             else:
                 pieces.append([a, b, weight])
 
+        # ---- 精确累计与达标判定：加权秒数以有理数（Fraction）逐段精确累计，
+        # 不做 float 连乘连加，也不加容差——权重 1e308 × 2 秒这类合法输入不再
+        # 溢出，总计 100 对预算 100.0000000005 也不会误报达到；仅真实累计
+        # 达到预算才给出首次达到时刻（恰在段末/查询结束达到仍有效）。
+        # 输出时再换算为可序列化的有限 float（超出 float64 范围饱和到最大有限值）。
+        budget_exact = Fraction(budget)
         segments: List[Dict[str, Any]] = []
-        total_weighted = 0.0
+        total_exact = Fraction(0)
         reached_epoch: Optional[float] = None
         for s, e, weight in pieces:
             duration = e - s
-            weighted = duration * weight
-            segment_base = total_weighted
-            total_weighted += weighted
-            if reached_epoch is None and total_weighted + 1e-9 >= budget:
-                # 累计在本段 [s, e) 内首次达到预算：按权重匀速反推时刻
-                need = min(max(budget - segment_base, 0.0), weighted)
-                reached_epoch = s if weight <= 0.0 else s + (need / weight)
+            weight_exact = Fraction(weight)
+            weighted_exact = Fraction(duration) * weight_exact
+            segment_base = total_exact
+            total_exact += weighted_exact
+            if reached_epoch is None and total_exact >= budget_exact:
+                # 真实累计在本段 [s, e) 内首次达到预算：按权重匀速反推时刻
+                need = min(max(budget_exact - segment_base, Fraction(0)), weighted_exact)
+                reached_epoch = float(Fraction(s) + need / weight_exact)
             segments.append(
                 {
                     "start": _iso_z(datetime.fromtimestamp(s, timezone.utc)),
                     "end": _iso_z(datetime.fromtimestamp(e, timezone.utc)),
                     "duration_sec": round(duration, 6),
                     "weight": weight,
-                    "weighted_sec": round(weighted, 6),
+                    "weighted_sec": round(_finite_float(weighted_exact), 6),
                 }
             )
 
@@ -1002,7 +1030,7 @@ class AuditService:
             "budget_weighted_sec": budget,
             "point_count": len(points),
             "segments": segments,
-            "total_weighted_sec": round(total_weighted, 6),
+            "total_weighted_sec": round(_finite_float(total_exact), 6),
             "budget_reached_at": (
                 None
                 if reached_epoch is None
